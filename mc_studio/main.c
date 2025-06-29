@@ -1,46 +1,106 @@
 /*
- * adc_converte_tensao.c
+ * adc_uart_btn_int.c
+ * ATmega328P @ 8 MHz
+ *
+ * Converte o ADC1 quando:
+ *   • chegar pela UART a LETRA_CHAVE, ou
+ *   • o botão (PD2, INT0) for pressionado.
+ * Resultado é enviado pela UART.
+ * — UART 2400 bps 8 N 1
+ * — Interrupções: INT0, USART_RX, ADC
  */
-#define F_CPU 8000000UL //frequencia do microcontrolador
-#include <stdio.h>      //uso printf
-#include <avr/io.h>     //definicoes do componente
-#include <util/delay.h> //uso do delay
 
-void uartInit (void)               //inicializa uart
-{ UBRR0  = F_CPU/16/9600-1;        //ajusta a taxa de transmissao
-  UCSR0A = 0;                      //valor padrao
-  UCSR0B = (1<<RXEN0) |(1<<TXEN0); //habilita a transmissao e recepcao. Sem interrupcao
-  UCSR0C = (1<<UCSZ01)|(1<<UCSZ00);//assincrono, 8 bits, 1 bit de parada, sem paridade
+#define F_CPU 8000000UL
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <stdio.h>
+
+/* ---------- parâmetros ------------------------------------------------ */
+#define BAUD          2400
+#define UBRR_VALUE    (F_CPU/16/BAUD - 1)      /* 8 MHz ? 207          */
+
+#define LETRA_CHAVE   'e'      /* 1ª letra do seu nome               */
+#define USE_8_MSB     0        /* 1 = envia só 8 MSB (0-255)         */
+
+#define BTN_BIT       PD2      /* botão em D2 / INT0                 */
+
+/* ---------- UART (TX por polling, RX por interrupção) ----------------- */
+static int uart_putchar(char c, FILE *stream)
+{
+    while (!(UCSR0A & (1 << UDRE0)));  /* espera DR vazio */
+    UDR0 = c;
+    return 0;
+}
+static FILE mystdout = FDEV_SETUP_STREAM(uart_putchar, NULL, _FDEV_SETUP_WRITE);
+
+static void uartInit(void)
+{
+    UBRR0  = UBRR_VALUE;
+    UCSR0B = (1 << RXEN0)  | (1 << TXEN0)  | (1 << RXCIE0); /* RX, TX, IRQ RX */
+    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);                 /* 8 N 1          */
 }
 
-//configura o conversor A/D
-void adcInit()
-{ ADCSRA = 0b10000110; //habilita ADC. Prescaler 64. 0b10001110=>interrupcao
-  ADCSRB = 0b00000000; //valor padrao
-  DIDR0  = 0b00000001; //habilita pino PC0 (ADC0) como entrada analogica
-  ADMUX  = 0b01000000; //referencia AVcc. Alinhamento a direita. Canal ADC0
+/* ---------- ADC (canal 1 = PC1 / ADC1) ------------------------------- */
+static void adcInit(void)
+{
+    ADMUX  = (1 << REFS0) | (1 << MUX0);         /* AVcc, canal ADC1 */
+    ADCSRA = (1 << ADEN)  | (1 << ADIE) |        /* liga ADC + IRQ   */
+             (1 << ADPS2) | (1 << ADPS1);        /* presc 64 (125 k) */
+    DIDR0  = (1 << ADC1D);                       /* desliga digital  */
 }
 
-static int put_char (char c,FILE *stream) //direciona string para UART
-{ while(!(UCSR0A & (1<<UDRE0)));          //aguarda ultimo dado ser enviado
-  UDR0 = c;                               //envia caracter
-  return 0;
+/* ---------- Botão INT0 ------------------------------------------------ */
+static void int0Init(void)
+{
+    DDRD  &= ~(1 << BTN_BIT);                    /* entrada          */
+    PORTD |=  (1 << BTN_BIT);                    /* pull-up interno  */
+    EICRA  =  (1 << ISC01);                      /* borda de descida */
+    EIMSK  =  (1 << INT0);                       /* habilita INT0    */
 }
 
-static FILE mystdout = FDEV_SETUP_STREAM(put_char,NULL,_FDEV_SETUP_WRITE);
+/* ---------- ISRs ------------------------------------------------------ */
+/* flag para evitar iniciar nova conversão enquanto ADC ocupado          */
+volatile uint8_t adc_busy = 0;
 
+ISR(INT0_vect)                 /* botão */
+{
+    if (!adc_busy) { ADCSRA |= (1 << ADSC); adc_busy = 1; }
+}
+
+ISR(USART_RX_vect)             /* letra pela UART */
+{
+    char c = UDR0;
+    if (c == LETRA_CHAVE && !adc_busy) {
+        ADCSRA |= (1 << ADSC);
+        adc_busy = 1;
+    }
+}
+
+ISR(ADC_vect)                  /* fim da conversão */
+{
+    uint16_t val = ADC;
+#if USE_8_MSB
+    uart_putchar('\r', stdout);                 /* limpa linha opc. */
+    uart_putchar('\n', stdout);
+    printf("%03u\r\n", val >> 2);
+#else
+    printf("ADC=%4u  Tensao=%1.3f V\r\n",
+           val, val * (5.0 / 1024.0));
+#endif
+    adc_busy = 0;
+}
+
+/* ---------- MAIN ------------------------------------------------------ */
 int main(void)
-{ uartInit();                       //inicializa UART
-  adcInit();                        //inicializa Conversor AD
-  stdout= &mystdout;                //direciona uart como saida padrao
-  uint16_t valorADC;                //variavel que armazena o valor convertido
-  float    tensao;                  //tensao lida
-  while (1)                         //laco infinito
-  { ADCSRA |= 1<<ADSC;              //Inicia conversao (ADSC = 1)
-    while(ADCSRA & (1<<ADSC));      //aguarda fim da conversao (ADSC = 0)
-    valorADC = ADC;                 //retorna o valor do A/D
-    tensao = valorADC*(5.0/1024.0); //valor da tensao em Volts
-    printf("ADC = %3d - Tensao = %7.5f\n",valorADC,tensao);//mostra valor lido
-    _delay_ms(1000);                //aguarda
-  }
+{
+    uartInit();
+    adcInit();
+    int0Init();
+    stdout = &mystdout;
+
+    sei();                          /* habilita interrupções globais */
+
+    /* Loop ocioso: MCU fica livre; tudo acontece por IRQs */
+    for (;;)
+        ;                           /* pode colocar SLEEP aqui se quiser */
 }
